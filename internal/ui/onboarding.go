@@ -2,6 +2,7 @@ package ui
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,7 +116,7 @@ func ShowSetupWizard(fyneApp fyne.App, store *pass.Store, kr *pass.Keyring, onRe
 				return
 			}
 			defer rc.Close()
-			data, readErr := os.ReadFile(rc.URI().Path())
+			data, readErr := io.ReadAll(rc)
 			if readErr == nil {
 				keyArmorEntry.SetText(string(data))
 			}
@@ -139,6 +140,10 @@ func ShowSetupWizard(fyneApp fyne.App, store *pass.Store, kr *pass.Keyring, onRe
 		}
 		if armor == "" && !kr.HasPrivateKey() {
 			importErrLabel.SetText("Вставьте приватный PGP-ключ (.asc) или загрузите его из файла.")
+			return
+		}
+		if !kr.HasPrivateKey() {
+			importErrLabel.SetText("Импортирован только публичный ключ. Нужен приватный PGP-ключ (.asc).")
 			return
 		}
 		if armor != "" {
@@ -242,7 +247,7 @@ func (a *App) lockSession() {
 	if a.store != nil && a.store.Keyring != nil {
 		a.store.Keyring.Lock()
 	}
-	a.cache = make(map[string]*pass.Secret)
+	a.cacheReset()
 	a.clearSelection()
 	a.setStatus("Хранилище заблокировано")
 }

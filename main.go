@@ -30,6 +30,7 @@ func main() {
 	uiScale := flag.Float64("ui-scale", float64(ui.DefaultUIScale), "плотность интерфейса: 1 — как в Fyne, меньше — компактнее")
 	versionFlag := flag.Bool("version", false, "показать версию и выйти")
 	deleteName := flag.String("delete", "", "удалить запись и выйти")
+	backendFlag := flag.String("backend", "auto", "режим работы: auto (по умолчанию), cli (системный pass) или embedded (встроенный OpenPGP)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Go Pass %s — графический менеджер паролей для pass\n\n", version)
@@ -58,7 +59,7 @@ func main() {
 		}
 	}
 
-	store, err := pass.NewAuto(kr)
+	store, err := pass.NewAuto(kr, pass.BackendMode(*backendFlag))
 	if err != nil {
 		fail(err)
 	}

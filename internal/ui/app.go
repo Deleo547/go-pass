@@ -297,7 +297,11 @@ func (a *App) build() {
 	a.status = widget.NewLabel("Готово")
 	a.status.Truncation = fyne.TextTruncateEllipsis
 
-	storeLabel := widget.NewLabel("хранилище: " + abbreviateHome(a.store.Dir))
+	backendMode := "pass"
+	if a.store.Keyring != nil {
+		backendMode = "embedded"
+	}
+	storeLabel := widget.NewLabel(fmt.Sprintf("[%s] %s", backendMode, abbreviateHome(a.store.Dir)))
 	storeLabel.TextStyle = fyne.TextStyle{Italic: true}
 	storeLabel.Alignment = fyne.TextAlignTrailing
 

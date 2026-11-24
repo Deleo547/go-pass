@@ -90,7 +90,12 @@ func InitStore(dir, recipientID string) error {
 		return fmt.Errorf("не удалось создать каталог хранилища: %w", err)
 	}
 	gpgID := filepath.Join(dir, ".gpg-id")
-	return os.WriteFile(gpgID, []byte(strings.TrimSpace(recipientID)+"\n"), 0o600)
+	if err := os.WriteFile(gpgID, []byte(strings.TrimSpace(recipientID)+"\n"), 0o600); err != nil {
+		return err
+	}
+	s := &Store{Dir: dir}
+	s.gitCommitEntry(gpgID, "Set GPG id to "+strings.TrimSpace(recipientID)+".")
+	return nil
 }
 
 func (s *Store) showEmbedded(name string) (*Secret, error) {
@@ -123,6 +128,36 @@ func (s *Store) showEmbedded(name string) (*Secret, error) {
 		return nil, lastErr
 	}
 	return nil, ErrLocked
+}
+
+// gitCommitEntry stages target (including deletions) and commits it if s.Dir is
+// inside a git repository and `git` is available.
+func (s *Store) gitCommitEntry(target, message string) {
+	dir := s.Dir
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		return
+	}
+	gitBin, err := exec.LookPath("git")
+	if err != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	addCmd := exec.CommandContext(ctx, gitBin, "-C", dir, "add", "-A")
+	if err := addCmd.Run(); err != nil {
+		return
+	}
+
+	commitCmd := exec.CommandContext(ctx, gitBin, "-C", dir,
+		"-c", "user.name=go-pass",
+		"-c", "user.email=go-pass@localhost",
+		"commit", "-m", message)
+	_ = commitCmd.Run()
 }
 
 func (s *Store) insertEmbedded(name, content string) error {
@@ -163,6 +198,19 @@ func (s *Store) insertEmbedded(name, content string) error {
 		return fmt.Errorf("не удалось записать файл записи: %w", err)
 	}
 	return os.Rename(tmp, target)
+	existed := false
+	if _, statErr := os.Stat(target); statErr == nil {
+		existed = true
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		return err
+	}
+	action := "Add"
+	if existed {
+		action = "Edit"
+	}
+	s.gitCommitEntry(target, fmt.Sprintf("%s %s with go-pass.", action, name))
+	return nil
 }
 
 func (s *Store) deleteEmbedded(name string) error {
@@ -178,6 +226,13 @@ func (s *Store) deleteEmbedded(name string) error {
 	}
 	s.pruneEmptyParents(target)
 	return nil
+	if err := os.Remove(target); err != nil {
+		return fmt.Errorf("не удалось удалить %s: %w", name, err)
+	}
+	s.pruneEmptyParents(target)
+	s.gitCommitEntry(target, fmt.Sprintf("Remove %s from store with go-pass.", name))
+	return nil
+
 }
 
 // New discovers the `pass` binary and the password store directory.
@@ -245,47 +300,64 @@ func (s *Store) IsInitialized() bool {
 	return true
 }
 
-// NewAuto builds a Store that uses the embedded OpenPGP keyring whenever a
-// private key is present in kr or when the external `pass` CLI is absent.
-// If the store directory is not initialized yet, it still returns a valid
-// Store so the GUI can launch the first-run setup wizard.
-func NewAuto(kr *Keyring) (*Store, error) {
+// / BackendMode selects how Store reads and writes encrypted entries.
+type BackendMode string
+
+const (
+	BackendAuto     BackendMode = "auto"
+	BackendCLI      BackendMode = "cli"
+	BackendEmbedded BackendMode = "embedded"
+)
+
+// NewAuto resolves the Store backend according to mode ("auto", "cli", "embedded").
+// In "auto" mode, an existing store with an installed `pass` CLI ALWAYS prefers
+// the CLI backend so hooks, gpg-agent and git workflows are never silently bypassed.
+func NewAuto(kr *Keyring, mode BackendMode) (*Store, error) {
+	if mode == "" {
+		mode = BackendAuto
+	}
 	abs, err := DefaultStoreDir()
 	if err != nil {
 		return nil, err
 	}
 
 	binary, cliErr := findPassBinary()
+	_, gpgIDStat := os.Stat(filepath.Join(abs, ".gpg-id"))
+	hasStore := gpgIDStat == nil
 
-	// Use embedded OpenPGP if user already configured a key in the app,
-	// or if external `pass` CLI is not installed on the machine.
-	if kr != nil && (kr.HasPrivateKey() || cliErr != nil) {
-		return &Store{
-			Dir:     abs,
-			Timeout: DefaultTimeout,
-			Keyring: kr,
-		}, nil
-	}
+	switch mode {
+	case BackendCLI:
+		if cliErr != nil {
+			return nil, cliErr
+		}
+		if !hasStore {
+			return nil, fmt.Errorf("хранилище паролей не найдено: %s", abs)
+		}
+		return &Store{Binary: binary, Dir: abs, Timeout: DefaultTimeout}, nil
 
-	// External `pass` CLI is available and user hasn't switched to embedded keyring.
-	if info, statErr := os.Stat(abs); statErr == nil && info.IsDir() {
-		return &Store{
-			Binary:  binary,
-			Dir:     abs,
-			Timeout: DefaultTimeout,
-		}, nil
-	}
+	case BackendEmbedded:
+		if kr == nil {
+			return nil, errors.New("встроенный режим требует инициализированный Keyring")
+		}
+		return &Store{Dir: abs, Timeout: DefaultTimeout, Keyring: kr}, nil
 
-	// Neither store dir nor embedded key exists yet — fall back to embedded
-	// mode so the onboarding wizard can create everything out of the box.
-	if kr != nil {
-		return &Store{
-			Dir:     abs,
-			Timeout: DefaultTimeout,
-			Keyring: kr,
-		}, nil
+	case BackendAuto:
+		// Если установлены CLI `pass` и хранилище уже инициализировано —
+		// никогда не переключаемся тихо в embedded, даже если в keyring есть ключ.
+		if cliErr == nil && hasStore {
+			return &Store{Binary: binary, Dir: abs, Timeout: DefaultTimeout}, nil
+		}
+		if kr != nil {
+			return &Store{Dir: abs, Timeout: DefaultTimeout, Keyring: kr}, nil
+		}
+		if cliErr != nil {
+			return nil, cliErr
+		}
+		return nil, fmt.Errorf("хранилище паролей не найдено: %s", abs)
+
+	default:
+		return nil, fmt.Errorf("неизвестный режим хранилища: %q (ожидается auto, cli или embedded)", mode)
 	}
-	return nil, fmt.Errorf("хранилище паролей не найдено: %s", abs)
 }
 
 // expandHome resolves a leading "~" in p.
